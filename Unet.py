@@ -1,9 +1,10 @@
-# == 1. 导入与配置 (IMPORTS & CONFIG) ==
+# ======================================================================
+# 1. IMPORTS & CONFIGURATION
+# ======================================================================
 import os
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image, ImageSequence
 import matplotlib.pyplot as plt
@@ -12,10 +13,10 @@ import time
 from tqdm import tqdm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-import timm
 from einops import rearrange
+from torch.nn import functional as F
 
-# --- 超参数配置 ---
+# --- Main Configuration Class ---
 class Config:
     GPU_ID = 3
     DEVICE = None
@@ -23,15 +24,29 @@ class Config:
     TRAIN_IMG_PATH = os.path.join(DATA_PATH_PREFIX, 'train-volume.tif')
     TRAIN_LBL_PATH = os.path.join(DATA_PATH_PREFIX, 'train-labels.tif')
     MODEL_SAVE_PATH = 'best_transunet_model.pth'
+    
+    # --- Training Hyperparameters ---
     NUM_EPOCHS = 150
-    BATCH_SIZE = 2 # TransUNet模型较大，减小batch size
+    BATCH_SIZE = 2 # TransUNet is memory-intensive
     LEARNING_RATE = 1e-4
     VALIDATION_SPLIT = 0.2
+    EARLY_STOPPING_PATIENCE = 15
+    
+    # --- Model Specific Parameters for TransUNet ---
+    IMG_DIM = 512 # Input images will be resized to this
     N_CHANNELS = 1
     N_CLASSES = 2
-    EARLY_STOPPING_PATIENCE = 15
+    
+    # --- ViT Parameters ---
+    VIT_PATCH_SIZE = 16
+    VIT_HIDDEN_DIM = 768
+    VIT_MLP_DIM = 3072
+    VIT_NUM_HEADS = 12
+    VIT_NUM_LAYERS = 12
 
-# --- 环境设置 ---
+# ======================================================================
+# 2. UTILITIES & SETUP
+# ======================================================================
 def setup_environment(config):
     os.environ["CUDA_VISIBLE_DEVICES"] = str(config.GPU_ID)
     config.DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -45,159 +60,185 @@ def setup_environment(config):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-config = Config()
-setup_environment(config)
-
-# == 2. SOTA数据加载与增强 (ADVANCED DATA LOADING & AUGMENTATION) ==
 def load_multipage_tiff(path):
     return np.array([np.array(p) for p in ImageSequence.Iterator(Image.open(path))])
 
-class AlbumentationsDataset(Dataset):
-    def __init__(self, images, labels, transform=None):
+config = Config()
+setup_environment(config)
+
+# ======================================================================
+# 3. ADVANCED DATA AUGMENTATION (ALBUMENTATIONS)
+# ======================================================================
+class ISBI_Dataset(Dataset):
+    def __init__(self, images, labels, img_dim, augment=False):
         self.images = images
         self.labels = labels
-        self.transform = transform
+        self.img_dim = img_dim
+        self.augment = augment
+        
+        # Define base transforms (resizing and tensor conversion)
+        self.base_transform = A.Compose([
+            A.Resize(img_dim, img_dim, interpolation=Image.BILINEAR),
+            A.Normalize(mean=(0.5,), std=(0.5,)), # Normalize to [-1, 1]
+            ToTensorV2(),
+        ])
+        
+        # Define augmentation pipeline if enabled
+        if self.augment:
+            self.aug_transform = A.Compose([
+                A.Resize(img_dim, img_dim, interpolation=Image.BILINEAR),
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.RandomRotate90(p=0.5),
+                # SOTA augmentations for medical images
+                A.ElasticTransform(p=0.5, alpha=120, sigma=120 * 0.05, alpha_affine=120 * 0.03),
+                A.GridDistortion(p=0.5),
+                A.OpticalDistortion(p=0.5, distort_limit=2, shift_limit=0.5),
+                # Color augmentations
+                A.RandomBrightnessContrast(p=0.5),
+                A.Normalize(mean=(0.5,), std=(0.5,)),
+                ToTensorV2(),
+            ])
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx):
         image = self.images[idx]
-        mask = self.labels[idx].copy()
-        mask[mask == 255] = 1 # 转换标签
+        mask = self.labels[idx]
+        mask[mask == 255] = 1 # Convert mask to 0s and 1s
 
-        if self.transform:
-            augmented = self.transform(image=image, mask=mask)
-            image = augmented['image']
-            mask = augmented['mask']
-        
-        return image, mask.long()
+        if self.augment:
+            transformed = self.aug_transform(image=image, mask=mask)
+        else:
+            transformed = self.base_transform(image=image, mask=mask)
+            
+        return transformed['image'].float(), transformed['mask'].long()
 
-# --- 定义增强流程 ---
-# 注意：TransUNet通常在更大分辨率上预训练，这里我们调整图像大小以匹配
-IMG_SIZE = 224
-train_transforms = A.Compose([
-    A.Resize(IMG_SIZE, IMG_SIZE),
-    A.Rotate(limit=35, p=0.7),
-    A.HorizontalFlip(p=0.5),
-    A.VerticalFlip(p=0.5),
-    A.ElasticTransform(p=0.5, alpha=120, sigma=120 * 0.05, alpha_affine=120 * 0.03),
-    A.Normalize(mean=(0.5,), std=(0.5,)), # 标准化到[-1, 1]
-    ToTensorV2(),
-])
-val_transforms = A.Compose([
-    A.Resize(IMG_SIZE, IMG_SIZE),
-    A.Normalize(mean=(0.5,), std=(0.5,)),
-    ToTensorV2(),
-])
-
-# == 3. SOTA模型: TransUNet (MODEL: TransUNet) ==
-# --- 辅助模块 ---
-class CNNEncoder(nn.Module):
-    def __init__(self, in_channels=1, depths=[64, 128, 256, 512]):
+# ======================================================================
+# 4. SOTA MODEL: TransUNet
+# ======================================================================
+# --- Helper Modules for TransUNet ---
+class SelfAttention(nn.Module):
+    def __init__(self, dim, heads=8, dim_head=64):
         super().__init__()
-        self.encoder_stages = nn.ModuleList()
-        for i in range(len(depths)):
-            in_c = in_channels if i == 0 else depths[i-1]
-            out_c = depths[i]
-            stage = nn.Sequential(
-                nn.Conv2d(in_c, out_c, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm2d(out_c),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(out_c, out_c, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm2d(out_c),
-                nn.ReLU(inplace=True),
-            )
-            self.encoder_stages.append(stage)
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        inner_dim = dim_head * heads
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
+        self.to_out = nn.Linear(inner_dim, dim)
 
     def forward(self, x):
-        skip_connections = []
-        for stage in self.encoder_stages:
-            x = stage(x)
-            skip_connections.append(x)
-            x = self.pool(x)
-        return x, skip_connections
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), qkv)
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        attn = dots.softmax(dim=-1)
+        out = torch.matmul(attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
 
-class DecoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, heads, dim_head, mlp_dim):
         super().__init__()
-        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = SelfAttention(dim, heads, dim_head)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Linear(mlp_dim, dim)
         )
+    def forward(self, x):
+        x = self.attn(self.norm1(x)) + x
+        x = self.mlp(self.norm2(x)) + x
+        return x
 
-    def forward(self, x, skip):
-        x = self.up(x)
-        x = torch.cat([skip, x], dim=1)
-        return self.conv(x)
-
-# --- TransUNet 主体 ---
+# --- Main TransUNet Architecture ---
 class TransUNet(nn.Module):
-    def __init__(self, in_channels=1, n_classes=2, img_size=224):
+    def __init__(self, *, img_dim, in_channels, classes,
+                 vit_patch_size, vit_hidden_dim, vit_mlp_dim,
+                 vit_num_heads, vit_num_layers):
         super().__init__()
-        # --- CNN Encoder ---
-        self.encoder_depths = [64, 128, 256]
-        self.cnn_encoder = CNNEncoder(in_channels, self.encoder_depths)
+        # --- CNN Encoder (Downsampling path) ---
+        self.patch_dim = vit_patch_size
+        self.conv1 = nn.Sequential(nn.Conv2d(in_channels, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+                                   nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU())
+        self.pool1 = nn.MaxPool2d(2)
+        self.conv2 = nn.Sequential(nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+                                   nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU())
+        self.pool2 = nn.MaxPool2d(2)
+        self.conv3 = nn.Sequential(nn.Conv2d(128, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
+                                   nn.Conv2d(256, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU())
+        self.pool3 = nn.MaxPool2d(2)
         
-        # --- ViT Bottleneck ---
-        self.vit = timm.create_model('vit_base_patch16_224_in21k', pretrained=True)
-        # 调整ViT的输入层以接受CNN的输出通道数
-        self.vit.patch_embed.proj = nn.Conv2d(self.encoder_depths[-1], 768, kernel_size=16, stride=16)
+        # --- Bridge from CNN to Transformer ---
+        self.to_patch_embedding = nn.Conv2d(256, vit_hidden_dim, kernel_size=self.patch_dim, stride=self.patch_dim)
+        num_patches = (img_dim // (2**3 * self.patch_dim)) ** 2
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, vit_hidden_dim))
+        self.cls_token = nn.Parameter(torch.randn(1, 1, vit_hidden_dim))
+
+        # --- Transformer Encoder ---
+        self.transformer = nn.Sequential(
+            *[TransformerBlock(vit_hidden_dim, vit_num_heads, vit_hidden_dim // vit_num_heads, vit_mlp_dim) for _ in range(vit_num_layers)]
+        )
         
-        # --- Decoder ---
-        self.decoder_depths = [512, 256, 128, 64]
-        # 解码ViT输出的块
-        self.up_vit = DecoderBlock(768, 512)
-        
-        self.decoder_blocks = nn.ModuleList()
-        # 256->512, 128->256, 64->128
-        in_depths = [d*2 for d in self.encoder_depths[::-1]] # [512, 256, 128]
-        out_depths = self.encoder_depths[::-1] # [256, 128, 64]
-        self.decoder_blocks.append(DecoderBlock(in_depths[0], out_depths[0]))
-        self.decoder_blocks.append(DecoderBlock(in_depths[1], out_depths[1]))
-        self.decoder_blocks.append(DecoderBlock(in_depths[2], out_depths[2]))
-        
-        self.final_conv = nn.Conv2d(out_depths[-1], n_classes, kernel_size=1)
+        # --- Decoder (Upsampling Path) ---
+        self.up3 = nn.ConvTranspose2d(vit_hidden_dim, 256, 2, stride=2)
+        self.dec_conv3 = nn.Sequential(nn.Conv2d(512, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
+                                       nn.Conv2d(256, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU())
+        self.up2 = nn.ConvTranspose2d(256, 128, 2, stride=2)
+        self.dec_conv2 = nn.Sequential(nn.Conv2d(256, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+                                       nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU())
+        self.up1 = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.dec_conv1 = nn.Sequential(nn.Conv2d(128, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+                                       nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU())
+
+        self.final_conv = nn.Conv2d(64, classes, kernel_size=1)
 
     def forward(self, x):
-        _, skips = self.cnn_encoder(x)
-        vit_input = skips[-1]
-        
-        # --- ViT处理 ---
-        # 手动将输入展平为ViT期望的序列格式
-        # 输入vit_input [B, 256, 28, 28] -> 展平为 [B, 768, 1, 49] -> [B, 784, 768]
-        # 这里为了简化，我们直接用patch_embed处理，它会处理成 [B, N, D]
-        x_vit = self.vit.patch_embed(vit_input)
-        x_vit = self.vit.pos_drop(x_vit)
-        x_vit = self.vit.blocks(x_vit)
-        x_vit = self.vit.norm(x_vit)
-        
-        # 将ViT输出 reshape 回2D图像格式
-        # x_vit [B, N, D] -> [B, D, H, W]
-        # N = (H/P)*(W/P)
-        patch_size = self.vit.patch_embed.patch_size[0]
-        h = w = int(vit_input.shape[2] / patch_size)
-        x_vit = rearrange(x_vit, 'b (h w) c -> b c h w', h=h, w=w)
+        # CNN Encoder
+        c1 = self.conv1(x)
+        p1 = self.pool1(c1)
+        c2 = self.conv2(p1)
+        p2 = self.pool2(c2)
+        c3 = self.conv3(p2)
+        p3 = self.pool3(c3)
 
-        # --- Decoder ---
-        d_out = self.up_vit(x_vit, skips[-1]) # 这里的skip实际上是vit_input
-        d_out = self.decoder_blocks[0](d_out, skips[-2])
-        d_out = self.decoder_blocks[1](d_out, skips[-3])
-        # 这里需要对输入x进行下采样以匹配第一个skip的尺寸
-        x_resized_for_skip = nn.functional.interpolate(x, size=skips[0].shape[2:], mode='bilinear', align_corners=False)
-        d_out = self.decoder_blocks[2](d_out, skips[0])
+        # Transformer
+        patches = self.to_patch_embedding(p3)
+        patches = rearrange(patches, 'b c h w -> b (h w) c')
+        b, n, _ = patches.shape
+        cls_tokens = self.cls_token.expand(b, -1, -1)
+        x = torch.cat((cls_tokens, patches), dim=1)
+        x += self.pos_embedding[:, :(n + 1)]
+        x = self.transformer(x)
         
-        # --- 上采样到原始尺寸 ---
-        out = nn.functional.interpolate(d_out, size=x.shape[2:], mode='bilinear', align_corners=False)
-        return self.final_conv(out)
+        # Reshape to 2D for decoder
+        transformer_out = x[:, 1:, :] # Drop CLS token
+        H = W = int(np.sqrt(transformer_out.shape[1]))
+        transformer_out = rearrange(transformer_out, 'b (h w) c -> b c h w', h=H, w=W)
+        
+        # Decoder
+        d3 = self.up3(transformer_out)
+        d3 = torch.cat([F.interpolate(c3, d3.shape[2:]), d3], dim=1)
+        d3 = self.dec_conv3(d3)
+        
+        d2 = self.up2(d3)
+        d2 = torch.cat([F.interpolate(c2, d2.shape[2:]), d2], dim=1)
+        d2 = self.dec_conv2(d2)
+        
+        d1 = self.up1(d2)
+        d1 = torch.cat([F.interpolate(c1, d1.shape[2:]), d1], dim=1)
+        d1 = self.dec_conv1(d1)
+        
+        # Final upsampling to original size
+        out = self.final_conv(d1)
+        return F.interpolate(out, size=(config.IMG_DIM, config.IMG_DIM), mode='bilinear', align_corners=False)
 
-# == 4. SOTA损失函数 (ADVANCED LOSS FUNCTION) ==
+
+# ======================================================================
+# 5. ADVANCED LOSS & METRICS
+# ======================================================================
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
         super().__init__()
@@ -206,9 +247,9 @@ class FocalLoss(nn.Module):
         self.reduction = reduction
 
     def forward(self, inputs, targets):
-        ce_loss = nn.functional.cross_entropy(inputs, targets, reduction='none')
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
         pt = torch.exp(-ce_loss)
-        focal_loss = self.alpha * (1-pt)**self.gamma * ce_loss
+        focal_loss = self.alpha * (1 - pt)**self.gamma * ce_loss
         if self.reduction == 'mean':
             return focal_loss.mean()
         return focal_loss.sum()
@@ -217,129 +258,164 @@ class DiceLoss(nn.Module):
     def __init__(self, smooth=1e-6):
         super().__init__()
         self.smooth = smooth
-
-    def forward(self, pred_prob, target):
-        target_one_hot = torch.nn.functional.one_hot(target, num_classes=config.N_CLASSES).permute(0, 3, 1, 2)
+    def forward(self, pred_logits, target):
+        pred_prob = torch.softmax(pred_logits, dim=1)
+        target_one_hot = F.one_hot(target, num_classes=config.N_CLASSES).permute(0, 3, 1, 2)
         pred_fg = pred_prob[:, 1, ...]
         target_fg = target_one_hot[:, 1, ...].float()
         intersection = (pred_fg * target_fg).sum()
         union = pred_fg.sum() + target_fg.sum()
-        dice = (2. * intersection + self.smooth) / (union + self.smooth)
-        return 1 - dice
+        dice_score = (2. * intersection + self.smooth) / (union + self.smooth)
+        return 1 - dice_score
 
-class DiceFocalLoss(nn.Module):
-    def __init__(self, dice_weight=0.5, alpha=0.25, gamma=2.0):
+class CombinedFocalDiceLoss(nn.Module):
+    def __init__(self, focal_weight=0.5):
         super().__init__()
-        self.dice_weight = dice_weight
-        self.focal_loss = FocalLoss(alpha, gamma)
-        self.dice_loss = DiceLoss()
+        self.focal_weight = focal_weight
+        self.focal = FocalLoss()
+        self.dice = DiceLoss()
+    def forward(self, pred, target):
+        return self.focal_weight * self.focal(pred, target) + (1 - self.focal_weight) * self.dice(pred, target)
 
-    def forward(self, logits, targets):
-        focal = self.focal_loss(logits, targets)
-        probs = torch.softmax(logits, dim=1)
-        dice = self.dice_loss(probs, targets)
-        return self.dice_weight * dice + (1 - self.dice_weight) * focal
-
-# == 5. 训练与评估 (TRAINING & EVALUATION) ==
-def dice_metric_func(pred_logits, target):
+# Metric function remains the same
+def dice_metric_func(pred_logits, target, smooth=1e-6):
     pred_class = pred_logits.argmax(dim=1)
-    # ... (dice calculation as before)
-    return dice_score
+    target_one_hot = F.one_hot(target, num_classes=config.N_CLASSES).permute(0, 3, 1, 2)
+    pred_one_hot = F.one_hot(pred_class, num_classes=config.N_CLASSES).permute(0, 3, 1, 2)
+    intersection = (pred_one_hot[:, 1] * target_one_hot[:, 1]).sum()
+    union = pred_one_hot[:, 1].sum() + target_one_hot[:, 1].sum()
+    return (2. * intersection + smooth) / (union + smooth)
 
-# (train_one_epoch and evaluate functions remain largely the same, just update progress bar descriptions)
+# ======================================================================
+# 6. TRAINING & EVALUATION LOOP
+# ======================================================================
+def train_one_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0
+    progress_bar = tqdm(loader, desc="Training", leave=False)
+    for images, masks in progress_bar:
+        images, masks = images.to(device), masks.to(device)
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, masks)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0) # Gradient Clipping
+        optimizer.step()
+        total_loss += loss.item()
+        progress_bar.set_postfix(loss=loss.item())
+    return total_loss / len(loader)
 
-# == 6. 测试时增强 (TEST-TIME AUGMENTATION) ==
-def tta_predict(model, image_tensor, device):
-    """
-    image_tensor: a single image tensor [C, H, W]
-    """
+def evaluate(model, loader, criterion, device):
     model.eval()
-    
-    transforms = {
-        'original': lambda x: x,
-        'hflip': lambda x: torch.flip(x, [2]),
-    }
-    
+    total_dice = 0
+    with torch.no_grad():
+        for images, masks in loader:
+            images, masks = images.to(device), masks.to(device)
+            outputs = model(images)
+            total_dice += dice_metric_func(outputs, masks).item()
+    return total_dice / len(loader)
+
+def evaluate_with_tta(model, image_tensor, device):
+    """ Test-Time Augmentation for a single image """
+    model.eval()
+    image_tensor = image_tensor.to(device)
     predictions = []
     
+    # Original
     with torch.no_grad():
-        for name, t in transforms.items():
-            augmented_img = t(image_tensor.clone()).unsqueeze(0).to(device)
-            output = model(augmented_img)
-            
-            # Reverse the transform for the prediction
-            if name == 'hflip':
-                output = torch.flip(output, [3])
-            
-            predictions.append(torch.softmax(output, dim=1))
-            
-    # Average the predictions
-    avg_prediction = torch.mean(torch.stack(predictions), dim=0)
-    return avg_prediction.squeeze(0) # [C, H, W]
+        pred = model(image_tensor.unsqueeze(0))
+        predictions.append(torch.softmax(pred, dim=1))
+        
+    # Flipped
+    with torch.no_grad():
+        pred_hf = model(torch.flip(image_tensor, [2]).unsqueeze(0))
+        predictions.append(torch.flip(torch.softmax(pred_hf, dim=1), [3]))
+        
+        pred_vf = model(torch.flip(image_tensor, [1]).unsqueeze(0))
+        predictions.append(torch.flip(torch.softmax(pred_vf, dim=1), [2]))
+        
+    avg_pred = torch.mean(torch.stack(predictions), dim=0)
+    return avg_pred.squeeze(0)
 
-# == 7. 主程序 (MAIN EXECUTION) ==
+# ======================================================================
+# 7. MAIN EXECUTION SCRIPT
+# ======================================================================
 def main():
-    # --- Data Loading ---
-    train_images = load_multipage_tiff(config.TRAIN_IMG_PATH)
-    train_labels = load_multipage_tiff(config.TRAIN_LBL_PATH)
-
-    indices = list(range(len(train_images)))
+    # --- Data Loading & Splitting ---
+    train_images_full = load_multipage_tiff(config.TRAIN_IMG_PATH)
+    train_labels_full = load_multipage_tiff(config.TRAIN_LBL_PATH)
+    indices = list(range(len(train_images_full)))
     random.shuffle(indices)
-    split_point = int(np.floor(config.VALIDATION_SPLIT * len(train_images)))
+    split_point = int(np.floor(config.VALIDATION_SPLIT * len(train_images_full)))
     val_indices, train_indices = indices[:split_point], indices[split_point:]
 
-    train_dataset = AlbumentationsDataset(train_images[train_indices], train_labels[train_indices], transform=train_transforms)
-    val_dataset = AlbumentationsDataset(train_images[val_indices], train_labels[val_indices], transform=val_transforms)
-    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True)
+    train_dataset = ISBI_Dataset(train_images_full[train_indices], train_labels_full[train_indices], config.IMG_DIM, augment=True)
+    val_dataset = ISBI_Dataset(train_images_full[val_indices], train_labels_full[val_indices], config.IMG_DIM, augment=False)
+    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=4)
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
+    print(f"Data ready: {len(train_dataset)} train, {len(val_dataset)} val samples.")
 
+    # --- Model, Loss, Optimizer, Scheduler ---
+    model = TransUNet(
+        img_dim=config.IMG_DIM, in_channels=config.N_CHANNELS, classes=config.N_CLASSES,
+        vit_patch_size=config.VIT_PATCH_SIZE, vit_hidden_dim=config.VIT_HIDDEN_DIM,
+        vit_mlp_dim=config.VIT_MLP_DIM, vit_num_heads=config.VIT_NUM_HEADS,
+        vit_num_layers=config.VIT_NUM_LAYERS
+    ).to(config.DEVICE)
+    criterion = CombinedFocalDiceLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=15, T_mult=2, eta_min=1e-6)
 
-    model = TransUNet(in_channels=config.N_CHANNELS, n_classes=config.N_CLASSES, img_size=IMG_SIZE).to(config.DEVICE)
-    criterion = DiceFocalLoss().to(config.DEVICE)
-    optimizer = optim.AdamW(model.parameters(), lr=config.LEARNING_RATE)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.NUM_EPOCHS, eta_min=1e-6)
+    # --- Training Loop ---
+    best_val_dice = -1
+    epochs_no_improve = 0
+    history = {'train_loss': [], 'val_dice': []}
+    start_time = time.time()
 
+    for epoch in range(config.NUM_EPOCHS):
+        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, config.DEVICE)
+        val_dice = evaluate(model, val_loader, criterion, config.DEVICE)
+        scheduler.step()
+        
+        print(f"Epoch {epoch+1}/{config.NUM_EPOCHS} | Train Loss: {train_loss:.4f} | Val Dice: {val_dice:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
+        history['train_loss'].append(train_loss)
+        history['val_dice'].append(val_dice)
 
-    visualize_with_tta(model, val_dataset, config)
+        if val_dice > best_val_dice:
+            best_val_dice = val_dice
+            torch.save(model.state_dict(), config.MODEL_SAVE_PATH)
+            print(f"  -> Best model saved with Dice: {best_val_dice:.4f}")
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+        
+        if epochs_no_improve >= config.EARLY_STOPPING_PATIENCE:
+            print(f"\nEarly stopping triggered after {epoch+1} epochs.")
+            break
+            
+    print(f"\nTraining finished in {(time.time() - start_time)/60:.2f} minutes.")
 
-def visualize_with_tta(model, dataset, config):
-    print("\n--- Visualizing Predictions with TTA ---")
+    # --- Final Visualization with TTA ---
     model.load_state_dict(torch.load(config.MODEL_SAVE_PATH))
-    model.to(config.DEVICE)
-    
-    for i in range(min(5, len(dataset))):
-        image, mask = dataset[i] # image is already transformed
+    num_visualize = min(5, len(val_dataset))
+    for i in range(num_visualize):
+        image, mask = val_dataset[i]
         
         # TTA Prediction
-        pred_prob_tta = tta_predict(model, image, config.DEVICE)
+        pred_prob_tta = evaluate_with_tta(model, image, config.DEVICE)
         pred_mask_tta = torch.argmax(pred_prob_tta, dim=0).cpu().numpy()
-
-        # Standard Prediction (for comparison)
+        
+        # Standard Prediction
         with torch.no_grad():
-            output_std = model(image.unsqueeze(0).to(config.DEVICE))
-            pred_mask_std = torch.argmax(output_std, dim=1).squeeze(0).cpu().numpy()
+            pred_prob_std = model(image.to(config.DEVICE).unsqueeze(0))
+            pred_mask_std = torch.argmax(pred_prob_std, dim=1).squeeze(0).cpu().numpy()
 
         plt.figure(figsize=(20, 5))
-        # Denormalize image for visualization
-        img_vis = image.permute(1, 2, 0).numpy() * 0.5 + 0.5
-        
-        plt.subplot(1, 4, 1)
-        plt.title("Input Image")
-        plt.imshow(img_vis, cmap='gray')
-        
-        plt.subplot(1, 4, 2)
-        plt.title("Ground Truth")
-        plt.imshow(mask.numpy(), cmap='gray')
-        
-        plt.subplot(1, 4, 3)
-        plt.title("Prediction (Standard)")
-        plt.imshow(pred_mask_std, cmap='gray')
-        
-        plt.subplot(1, 4, 4)
-        plt.title("Prediction (TTA)")
-        plt.imshow(pred_mask_tta, cmap='gray')
-        
+        plt.subplot(1, 4, 1); plt.imshow(image.squeeze().numpy(), cmap='gray'); plt.title("Input Image"); plt.axis('off')
+        plt.subplot(1, 4, 2); plt.imshow(mask.numpy(), cmap='gray'); plt.title("Ground Truth"); plt.axis('off')
+        plt.subplot(1, 4, 3); plt.imshow(pred_mask_std, cmap='gray'); plt.title("Prediction (Standard)"); plt.axis('off')
+        plt.subplot(1, 4, 4); plt.imshow(pred_mask_tta, cmap='gray'); plt.title("Prediction (TTA)"); plt.axis('off')
         plt.show()
 
 if __name__ == '__main__':
-    main() # Remember to fill in the training loop
+    main()
